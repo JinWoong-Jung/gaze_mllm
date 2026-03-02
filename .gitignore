@@ -1,0 +1,19 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# W&B local runs
+wandb/
+
+# Keep folder, ignore contents
+# data/
+data/*
+!data/.gitkeep
+
+# checkpoint/ (singular)
+checkpoint/*
+!checkpoint/.gitkeep
+
+# checkpoints/ (plural)
+checkpoints/*
+!checkpoints/.gitkeep

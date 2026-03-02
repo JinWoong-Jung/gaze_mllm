@@ -1,0 +1,99 @@
+model:
+  name: Qwen/Qwen3-VL-8B-Thinking # Qwen/Qwen3-VL-8B-Thinking | Qwen/Qwen3-VL-8B-Instruct | Qwen/Qwen3-VL-30B-Thinking | Qwen/Qwen3-VL-30B-Instruct
+  dtype: bfloat16
+  dino_name: facebook/dinov3-vitb16-pretrain-lvd1689m
+  train_dino: false
+  gradient_checkpointing: true
+  # full | lora | head_only
+  train_mode: head_only
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+
+data:
+  image_root: /mnt/elice/datahub/pixel-bucket-jinwoong/data/gazefollow_extended
+  train_annotation: /mnt/elice/datahub/pixel-bucket-jinwoong/data/gazefollow/train_annotations_new.txt
+  val_annotation: /mnt/elice/datahub/pixel-bucket-jinwoong/data/gazefollow/val_annotations_new.txt
+  test_annotation: /mnt/elice/datahub/pixel-bucket-jinwoong/data/gazefollow_extended/test_annotations_release.txt
+  label_root: /mnt/elice/datahub/pixel-bucket-jinwoong/data/gazefollow
+  label_embed_root: /mnt/elice/datahub/pixel-bucket-jinwoong/data/gazefollow/label-embeds
+  vocab2id_path: /mnt/elice/datahub/pixel-bucket-jinwoong/data/gazefollow/vocab2id.json
+
+  reason_output_root: /mnt/elice/datahub/pixel-bucket-jinwoong/data/gazefollow_reason/output
+  reason_mark_root: /mnt/elice/datahub/pixel-bucket-jinwoong/data/gazefollow_reason/mark
+  reason_prompt_root: /mnt/elice/datahub/pixel-bucket-jinwoong/data/gazefollow_reason/prompt
+  reason_feature_root: /mnt/elice/datahub/pixel-bucket-jinwoong/data/gazefollow_reason/features
+  # If set, h5 is used first; if key missing, fallback to reason_feature_root(.pt).
+  # expected datasets: keys (str), embeddings (float)
+  reason_feature_h5_path: /home/elicer/semgaze/data/gazefollow_reason/features/train.h5
+  # DINO pre-extracted feature usage
+  use_precomputed_dino_features: true
+  dino_feature_h5_train: null
+  dino_feature_h5_val: null
+  dino_feature_h5_test: null
+
+  include_mark_image: true
+  include_reason_text: false
+
+prompt:
+  base: |
+    You are a gaze estimation model.
+    Given scene image, head crop, and visual-prompt image, predict where the person is looking.
+    Return internal representation that helps coordinate regression.
+
+loss:
+  # recommended baseline
+  w_heatmap: 1.0
+  w_coord: 1.0
+  w_vec: 0.5
+  w_angle: 1.0
+  w_inout: 0.5
+  w_reason: 0.3
+  w_label: 0.3
+  heatmap_size: 64
+  heatmap_sigma: 3.0
+  reason_dim: 1024
+  label_dim: 512
+  angle_feature_dim: 512
+  # cosine | mse
+  reason_loss_type: cosine
+
+optim:
+  lr: 2.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+
+train:
+  seed: 42
+  device: cuda
+  # bf16 | fp16 | fp32
+  precision: bf16
+  print_model_summary: true
+  sanity_val_steps: 2
+  epochs: 3
+  batch_size: 128
+  grad_accum: 16
+  num_workers: 4
+  log_every: 10
+  progress_bar: true
+  num_train_samples: 108955
+  output_dir: /home/elicer/gaze_mllm/checkpoints/qwen3vl_gf
+
+eval:
+  batch_size: 1
+  num_workers: 2
+
+test:
+  run_after_train: true
+  batch_size: 1
+  num_workers: 2
+
+wandb:
+  log: true
+  project: gaze_mllm
+  entity: semgaze
+  name: qwen3vl_gf
+  group: null
+  # none | gradients | parameters | all
+  watch: none
+  watch_freq: 500
