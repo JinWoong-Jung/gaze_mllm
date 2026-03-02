@@ -1,4 +1,5 @@
 from typing import Dict
+import os
 
 import importlib
 
@@ -6,7 +7,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from transformers import AutoImageProcessor, AutoProcessor, DINOv3ViTModel
+from transformers import AutoConfig, AutoImageProcessor, AutoProcessor, DINOv3ViTModel
+
+
+def _resolve_qwen_hidden_size(cfg, default: int = 2048) -> int:
+    # Qwen-VL configs may expose hidden size at top-level or under text_config.
+    hs = getattr(cfg, "hidden_size", None)
+    if hs is not None:
+        return int(hs)
+    text_cfg = getattr(cfg, "text_config", None)
+    hs = getattr(text_cfg, "hidden_size", None) if text_cfg is not None else None
+    if hs is not None:
+        return int(hs)
+    return int(default)
 
 
 def masked_mean(hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -59,6 +72,10 @@ class Qwen3VLGazeModel(nn.Module):
         reason_dim: int = 768,
         label_dim: int = 512,
         angle_feature_dim: int = 512,
+        cache_dir: str = None,
+        local_files_only: bool = False,
+        use_precomputed_dino_features: bool = False,
+        dino_hidden_size_override: int = 768,
     ):
         super().__init__()
 
@@ -69,21 +86,55 @@ class Qwen3VLGazeModel(nn.Module):
         }
         dtype = dtype_map.get(torch_dtype, torch.bfloat16)
 
-        self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-        self.backbone = self._load_backbone(model_name, dtype)
+        if local_files_only and (not os.path.exists(model_name)):
+            raise FileNotFoundError(
+                f"local_files_only=True but model path does not exist: {model_name}. "
+                "Use a local model directory path."
+            )
 
+        self.processor = AutoProcessor.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            cache_dir=cache_dir,
+            local_files_only=local_files_only,
+        )
+        self.backbone = self._load_backbone(
+            model_name,
+            dtype,
+            cache_dir=cache_dir,
+            local_files_only=local_files_only,
+        )
+
+        self.use_precomputed_dino_features = bool(use_precomputed_dino_features)
         # Shared DINOv3 encoder; scene/mark are forwarded separately.
-        self.dino_processor = AutoImageProcessor.from_pretrained(dino_name)
-        self.dino_encoder = _from_pretrained_with_dtype(DINOv3ViTModel, dino_name, dtype)
+        # If precomputed DINO features are always provided, skip loading the DINO model itself.
+        self.dino_processor = None
+        self.dino_encoder = None
+        if not self.use_precomputed_dino_features:
+            self.dino_processor = AutoImageProcessor.from_pretrained(
+                dino_name,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+            )
+            self.dino_encoder = _from_pretrained_with_dtype(
+                DINOv3ViTModel,
+                dino_name,
+                dtype,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+            )
 
         if use_gradient_checkpointing and hasattr(self.backbone, "gradient_checkpointing_enable"):
             self.backbone.gradient_checkpointing_enable()
         # Only checkpoint DINO when it is trainable; otherwise this can emit warnings.
-        if use_gradient_checkpointing and train_dino and hasattr(self.dino_encoder, "gradient_checkpointing_enable"):
+        if self.dino_encoder is not None and use_gradient_checkpointing and train_dino and hasattr(self.dino_encoder, "gradient_checkpointing_enable"):
             self.dino_encoder.gradient_checkpointing_enable()
 
-        self.qwen_hidden_size = int(getattr(self.backbone.config, "hidden_size", 2048))
-        self.dino_hidden_size = int(getattr(self.dino_encoder.config, "hidden_size", 768))
+        self.qwen_hidden_size = _resolve_qwen_hidden_size(self.backbone.config, default=2048)
+        if self.dino_encoder is not None:
+            self.dino_hidden_size = int(getattr(self.dino_encoder.config, "hidden_size", dino_hidden_size_override))
+        else:
+            self.dino_hidden_size = int(dino_hidden_size_override)
 
         # Inject DINO(scene, mark) tokens into MLLM sequence by cross-attention.
         self.dino_to_qwen = nn.Linear(self.dino_hidden_size, self.qwen_hidden_size)
@@ -129,27 +180,61 @@ class Qwen3VLGazeModel(nn.Module):
         else:
             raise ValueError(f"Unsupported train_mode: {train_mode}")
 
-        for p in self.dino_encoder.parameters():
-            p.requires_grad = bool(train_dino)
+        if self.dino_encoder is not None:
+            for p in self.dino_encoder.parameters():
+                p.requires_grad = bool(train_dino)
 
     @staticmethod
-    def _load_backbone(model_name: str, dtype: torch.dtype):
+    def _load_backbone(model_name: str, dtype: torch.dtype, cache_dir: str = None, local_files_only: bool = False):
+        cfg = AutoConfig.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            cache_dir=cache_dir,
+            local_files_only=local_files_only,
+        )
+        cfg_type = type(cfg)
+
         candidate_classes = [
             "AutoModelForImageTextToText",
             "AutoModelForVision2Seq",
-            "AutoModelForCausalLM",
+            "AutoModel",
         ]
         transformers_mod = importlib.import_module("transformers")
-        last_err = None
+        attempts = []
         for cls_name in candidate_classes:
             cls = getattr(transformers_mod, cls_name, None)
             if cls is None:
                 continue
+            # Try only classes that explicitly support this config.
             try:
-                return _from_pretrained_with_dtype(cls, model_name, dtype, trust_remote_code=True)
+                if cfg_type not in cls._model_mapping.keys():
+                    continue
+            except Exception:
+                # If mapping introspection fails, still try loading.
+                pass
+            try:
+                return _from_pretrained_with_dtype(
+                    cls,
+                    model_name,
+                    dtype,
+                    trust_remote_code=True,
+                    low_cpu_mem_usage=True,
+                    cache_dir=cache_dir,
+                    local_files_only=local_files_only,
+                )
             except Exception as exc:
-                last_err = exc
-        raise RuntimeError(f"Failed to load model={model_name} with available AutoModel classes") from last_err
+                attempts.append((cls_name, exc))
+
+        if attempts:
+            cls_name, err = attempts[0]
+            raise RuntimeError(
+                f"Failed to load model={model_name} with {cls_name}. "
+                f"first_error={type(err).__name__}: {err}"
+            ) from err
+        raise RuntimeError(
+            f"Failed to load model={model_name}. "
+            "No compatible AutoModel class found for its config."
+        )
 
     def _enable_lora(self, lora_r: int, lora_alpha: int, lora_dropout: float):
         try:
@@ -169,6 +254,11 @@ class Qwen3VLGazeModel(nn.Module):
         self.backbone = get_peft_model(self.backbone, lora_cfg)
 
     def _encode_dino(self, images, device: torch.device) -> torch.Tensor:
+        if (self.dino_processor is None) or (self.dino_encoder is None):
+            raise RuntimeError(
+                "DINO encoder is not loaded. Enable online DINO or provide precomputed "
+                "scene_dino_feat/mark_dino_feat for every sample."
+            )
         dino_inputs = self.dino_processor(images=images, return_tensors="pt")
         dino_inputs = {k: v.to(device) for k, v in dino_inputs.items()}
         dino_outputs = self.dino_encoder(**dino_inputs, return_dict=True)
@@ -187,12 +277,18 @@ class Qwen3VLGazeModel(nn.Module):
         hidden = outputs.hidden_states[-1]
         attn = batch.get("attention_mask", torch.ones(hidden.shape[:2], device=hidden.device, dtype=torch.long))
 
-        if ("scene_dino_feat" in batch) and ("mark_dino_feat" in batch):
+        if "scene_dino_feat" in batch:
             scene_cls = batch["scene_dino_feat"].to(hidden.device)
-            mark_cls = batch["mark_dino_feat"].to(hidden.device)
+            if "mark_dino_feat" in batch:
+                mark_cls = batch["mark_dino_feat"].to(hidden.device)
+            else:
+                mark_cls = torch.zeros_like(scene_cls)
         else:
             scene_cls = self._encode_dino(batch["scene_images"], hidden.device)
-            mark_cls = self._encode_dino(batch["mark_images"], hidden.device)
+            if "mark_images" in batch:
+                mark_cls = self._encode_dino(batch["mark_images"], hidden.device)
+            else:
+                mark_cls = torch.zeros_like(scene_cls)
 
         dino_tokens = torch.stack([scene_cls, mark_cls], dim=1)
         dino_tokens = self.dino_to_qwen(dino_tokens)

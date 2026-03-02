@@ -68,13 +68,26 @@ def open_rgb(path: str) -> Image.Image:
 
 
 @torch.no_grad()
-def encode_batch(model, processor, paths: List[str], device: torch.device) -> torch.Tensor:
-    images = [open_rgb(p) for p in paths]
+def encode_batch(model, processor, paths: List[str], device: torch.device) -> Tuple[torch.Tensor, List[int], List[Tuple[str, str]]]:
+    images = []
+    valid_idx = []
+    skipped = []
+    for i, p in enumerate(paths):
+        try:
+            images.append(open_rgb(p))
+            valid_idx.append(i)
+        except Exception as exc:
+            skipped.append((p, str(exc)))
+
+    if len(images) == 0:
+        hidden = int(model.config.hidden_size)
+        return torch.empty((0, hidden), dtype=torch.float32), valid_idx, skipped
+
     inputs = processor(images=images, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
     out = model(**inputs, return_dict=True)
     cls = out.last_hidden_state[:, 0].to(torch.float32)
-    return cls.cpu()
+    return cls.cpu(), valid_idx, skipped
 
 
 def main(args):
@@ -95,34 +108,80 @@ def main(args):
     batch_size = args.batch_size
     n = len(samples)
     hidden = int(model.config.hidden_size)
+    skipped_log_path = out_path.with_suffix(out_path.suffix + ".skipped.log")
+    write_pos = 0
+    total_skipped = 0
 
     with h5py.File(out_path, "w") as f:
         str_dtype = h5py.string_dtype(encoding="utf-8")
-        keys_ds = f.create_dataset("keys", shape=(n,), dtype=str_dtype)
-        scene_ds = f.create_dataset("scene_embeddings", shape=(n, hidden), dtype="float32")
-        mark_ds = f.create_dataset("mark_embeddings", shape=(n, hidden), dtype="float32")
+        keys_ds = f.create_dataset("keys", shape=(n,), maxshape=(None,), dtype=str_dtype)
+        scene_ds = f.create_dataset("scene_embeddings", shape=(n, hidden), maxshape=(None, hidden), dtype="float32")
+        mark_ds = f.create_dataset("mark_embeddings", shape=(n, hidden), maxshape=(None, hidden), dtype="float32")
 
-        for s in range(0, n, batch_size):
-            e = min(n, s + batch_size)
-            chunk = samples[s:e]
-            keys = [x[0] for x in chunk]
-            scene_paths = [x[1] for x in chunk]
-            mark_paths = [x[2] for x in chunk]
+        with open(skipped_log_path, "w", encoding="utf-8") as logf:
+            for s in range(0, n, batch_size):
+                e = min(n, s + batch_size)
+                chunk = samples[s:e]
+                keys = [x[0] for x in chunk]
+                scene_paths = [x[1] for x in chunk]
+                mark_paths = [x[2] for x in chunk]
 
-            scene_emb = encode_batch(model, processor, scene_paths, device)
-            mark_emb = encode_batch(model, processor, mark_paths, device)
+                scene_emb, scene_valid, scene_skipped = encode_batch(model, processor, scene_paths, device)
+                for p, err in scene_skipped:
+                    total_skipped += 1
+                    logf.write(f"scene\t{p}\t{err}\n")
 
-            keys_ds[s:e] = keys
-            scene_ds[s:e] = scene_emb.numpy()
-            mark_ds[s:e] = mark_emb.numpy()
+                if len(scene_valid) == 0:
+                    if (s // batch_size) % 10 == 0:
+                        print(f"processed {e}/{n} (written={write_pos}, skipped={total_skipped})")
+                    continue
 
-            if (s // batch_size) % 10 == 0:
-                print(f"processed {e}/{n}")
+                valid_keys = [keys[i] for i in scene_valid]
+                valid_mark_paths = [mark_paths[i] for i in scene_valid]
+                mark_emb, mark_valid_rel, mark_skipped = encode_batch(model, processor, valid_mark_paths, device)
+                for p, err in mark_skipped:
+                    total_skipped += 1
+                    logf.write(f"mark\t{p}\t{err}\n")
+
+                if len(mark_valid_rel) == 0:
+                    if (s // batch_size) % 10 == 0:
+                        print(f"processed {e}/{n} (written={write_pos}, skipped={total_skipped})")
+                    continue
+
+                # Keep only rows valid in both scene and mark passes.
+                keep_rel = set(mark_valid_rel)
+                keep_rows = [i for i in range(len(scene_valid)) if i in keep_rel]
+                if len(keep_rows) == 0:
+                    if (s // batch_size) % 10 == 0:
+                        print(f"processed {e}/{n} (written={write_pos}, skipped={total_skipped})")
+                    continue
+
+                out_keys = [valid_keys[i] for i in keep_rows]
+                out_scene = scene_emb[keep_rows]
+                out_mark = mark_emb[keep_rows]
+
+                m = len(out_keys)
+                keys_ds[write_pos:write_pos + m] = out_keys
+                scene_ds[write_pos:write_pos + m] = out_scene.numpy()
+                mark_ds[write_pos:write_pos + m] = out_mark.numpy()
+                write_pos += m
+
+                if (s // batch_size) % 10 == 0:
+                    print(f"processed {e}/{n} (written={write_pos}, skipped={total_skipped})")
+
+        keys_ds.resize((write_pos,))
+        scene_ds.resize((write_pos, hidden))
+        mark_ds.resize((write_pos, hidden))
 
         f.attrs["dino_name"] = args.dino_name
         f.attrs["split"] = args.split
+        f.attrs["num_input_samples"] = n
+        f.attrs["num_written_samples"] = write_pos
+        f.attrs["num_skipped_images"] = total_skipped
 
     print(f"saved: {out_path}")
+    print(f"written samples: {write_pos}/{n}, skipped images: {total_skipped}")
+    print(f"skip log: {skipped_log_path}")
 
 
 if __name__ == "__main__":

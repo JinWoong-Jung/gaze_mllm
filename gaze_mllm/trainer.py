@@ -22,7 +22,6 @@ except Exception:
 class TrainArtifacts:
     model: Qwen3VLGazeModel
     optimizer: torch.optim.Optimizer
-    scheduler: torch.optim.lr_scheduler.LRScheduler
 
 
 def _numel(params):
@@ -86,8 +85,14 @@ def _init_wandb(cfg: Dict):
     wandb.define_metric("metric/test/multi_acc@1", summary="max")
     wandb.define_metric("metric/test/acc@1", summary="max")
     wandb.define_metric("metric/test/acc@3", summary="max")
+    wandb.define_metric("metric/val/dist", summary="min")
     wandb.define_metric("metric/val/l2", summary="min")
     wandb.define_metric("metric/val/inout_acc", summary="max")
+    wandb.define_metric("loss/val", summary="min")
+    wandb.define_metric("loss/val/heatmap", summary="min")
+    wandb.define_metric("loss/val/coord", summary="min")
+    wandb.define_metric("loss/val/angular", summary="min")
+    wandb.define_metric("loss/val/label", summary="min")
     wandb.define_metric("loss/train", summary="min")
     return run
 
@@ -106,6 +111,28 @@ def resolve_amp(train_cfg: Dict, device: torch.device):
 
 def _default(path_base: str, filename: str) -> str:
     return os.path.join(path_base, filename)
+
+
+def _validate_data_config(cfg: Dict):
+    data_cfg = cfg["data"]
+    use_precomputed = bool(data_cfg.get("use_precomputed_dino_features", False))
+    if not use_precomputed:
+        return
+
+    required = [("train", data_cfg.get("dino_feature_h5_train")), ("val", data_cfg.get("dino_feature_h5_val"))]
+    if data_cfg.get("test_annotation"):
+        required.append(("test", data_cfg.get("dino_feature_h5_test")))
+
+    missing = []
+    for split, path in required:
+        if (path is None) or (str(path).strip() == "") or (not os.path.exists(path)):
+            missing.append((split, path))
+    if missing:
+        details = ", ".join([f"{split}={path}" for split, path in missing])
+        raise ValueError(
+            "data.use_precomputed_dino_features=true 이지만 유효한 H5 경로가 없습니다. "
+            f"누락/미존재: {details}"
+        )
 
 
 def build_dataloaders(cfg: Dict, processor):
@@ -183,6 +210,7 @@ def build_dataloaders(cfg: Dict, processor):
         processor=processor,
         base_prompt=prompt_cfg["base"],
         include_mark_image=data_cfg.get("include_mark_image", True),
+        qwen_image_size=int(data_cfg.get("qwen_image_size", 256)),
     )
 
     train_loader = DataLoader(
@@ -218,6 +246,7 @@ def build_dataloaders(cfg: Dict, processor):
 
 def build_train_artifacts(cfg: Dict, device: torch.device) -> TrainArtifacts:
     model_cfg = cfg["model"]
+    data_cfg = cfg["data"]
     model = Qwen3VLGazeModel(
         model_name=model_cfg["name"],
         torch_dtype=model_cfg.get("dtype", "bfloat16"),
@@ -231,6 +260,10 @@ def build_train_artifacts(cfg: Dict, device: torch.device) -> TrainArtifacts:
         reason_dim=cfg["loss"].get("reason_dim", 768),
         label_dim=cfg["loss"].get("label_dim", 512),
         angle_feature_dim=cfg["loss"].get("angle_feature_dim", 512),
+        cache_dir=model_cfg.get("cache_dir", None),
+        local_files_only=bool(model_cfg.get("local_files_only", False)),
+        use_precomputed_dino_features=bool(data_cfg.get("use_precomputed_dino_features", False)),
+        dino_hidden_size_override=int(model_cfg.get("dino_hidden_size", 768)),
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -238,18 +271,7 @@ def build_train_artifacts(cfg: Dict, device: torch.device) -> TrainArtifacts:
         lr=cfg["optim"]["lr"],
         weight_decay=cfg["optim"].get("weight_decay", 0.01),
     )
-
-    total_steps = math.ceil(cfg["train"]["num_train_samples"] / cfg["train"]["batch_size"]) * cfg["train"]["epochs"]
-    warmup_steps = int(total_steps * cfg["optim"].get("warmup_ratio", 0.03))
-
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return float(step) / max(1.0, float(warmup_steps))
-        progress = float(step - warmup_steps) / max(1.0, float(total_steps - warmup_steps))
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    return TrainArtifacts(model=model, optimizer=optimizer, scheduler=scheduler)
+    return TrainArtifacts(model=model, optimizer=optimizer)
 
 
 def to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
@@ -320,19 +342,43 @@ def _load_vocab_embeddings(cfg: Dict, device: torch.device) -> Optional[torch.Te
 
 
 @torch.no_grad()
-def evaluate(model: Qwen3VLGazeModel, loader: DataLoader, cfg: Dict, device: torch.device) -> Dict[str, float]:
+def evaluate(model: Qwen3VLGazeModel, loader: DataLoader, cfg: Dict, device: torch.device, loss_cfg: Dict) -> Dict[str, float]:
     model.eval()
     amp_enabled, amp_dtype, _ = resolve_amp(cfg["train"], device)
+    use_pbar = bool(cfg["train"].get("progress_bar", True))
 
     total_dist = 0.0
     total_in = 0
     total_inout_correct = 0
     total_n = 0
+    num_batches = 0
+    loss_sums = {
+        "total": 0.0,
+        "heatmap": 0.0,
+        "coord": 0.0,
+        "vec": 0.0,
+        "angle": 0.0,
+        "inout": 0.0,
+        "reason": 0.0,
+        "label": 0.0,
+    }
 
-    for batch in loader:
+    iterator = tqdm(
+        loader,
+        total=len(loader),
+        desc="val",
+        dynamic_ncols=True,
+        leave=False,
+        disable=not use_pbar,
+    )
+    for batch in iterator:
         batch = to_device(batch, device)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             preds = model(batch)
+            losses = compute_losses(preds, batch, loss_cfg)
+        num_batches += 1
+        for k in loss_sums.keys():
+            loss_sums[k] += float(losses[k].item())
         pred_heat = torch.sigmoid(preds["gaze_heatmap_logit"])
         pred_xy = _heatmap_argmax_xy(pred_heat)
 
@@ -346,9 +392,28 @@ def evaluate(model: Qwen3VLGazeModel, loader: DataLoader, cfg: Dict, device: tor
         total_inout_correct += int((inout_pred == batch["inout"]).sum().item())
         total_n += int(batch["inout"].numel())
 
+        if use_pbar:
+            iterator.set_postfix(dist=f"{(total_dist / max(1, total_in)):.4f}")
+
+    val_dist = total_dist / max(1, total_in)
+    val_inout = total_inout_correct / max(1, total_n)
+    mean_losses = {k: (v / max(1, num_batches)) for k, v in loss_sums.items()}
     return {
-        "val_l2": total_dist / max(1, total_in),
-        "val_inout_acc": total_inout_correct / max(1, total_n),
+        # semgaze-style keys
+        "metric/val/dist": val_dist,
+        "metric/val/inout_acc": val_inout,
+        "loss/val": mean_losses["total"],
+        "loss/val/heatmap": mean_losses["heatmap"],
+        "loss/val/coord": mean_losses["coord"],
+        "loss/val/vec": mean_losses["vec"],
+        "loss/val/angular": mean_losses["angle"],
+        "loss/val/inout": mean_losses["inout"],
+        "loss/val/reason": mean_losses["reason"],
+        "loss/val/label": mean_losses["label"],
+        # backward-compatible aliases
+        "metric/val/l2": val_dist,
+        "metric/val_l2": val_dist,
+        "metric/val_inout_acc": val_inout,
     }
 
 
@@ -357,6 +422,7 @@ def evaluate_test_semgaze_metrics(model: Qwen3VLGazeModel, loader: DataLoader, c
     model.eval()
     amp_enabled, amp_dtype, _ = resolve_amp(cfg["train"], device)
     vocab_emb = _load_vocab_embeddings(cfg, device)
+    use_pbar = bool(cfg["train"].get("progress_bar", True))
 
     sum_dist_to_avg = 0.0
     sum_avg_dist = 0.0
@@ -371,7 +437,15 @@ def evaluate_test_semgaze_metrics(model: Qwen3VLGazeModel, loader: DataLoader, c
     multi_acc1_correct = 0
     multi_total = 0
 
-    for batch in loader:
+    iterator = tqdm(
+        loader,
+        total=len(loader),
+        desc="test",
+        dynamic_ncols=True,
+        leave=False,
+        disable=not use_pbar,
+    )
+    for batch in iterator:
         batch = to_device(batch, device)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             preds = model(batch)
@@ -419,6 +493,12 @@ def evaluate_test_semgaze_metrics(model: Qwen3VLGazeModel, loader: DataLoader, c
             sum_auc += float(auc.item())
             n_obs += 1
 
+        if use_pbar:
+            iterator.set_postfix(
+                auc=f"{(sum_auc / max(1, n_obs)):.4f}",
+                avg_dist=f"{(sum_avg_dist / max(1, n_obs)):.4f}",
+            )
+
     metrics = {
         "metric/test/acc@1": (acc1_correct / max(1, acc_total)),
         "metric/test/acc@3": (acc3_correct / max(1, acc_total)),
@@ -434,13 +514,13 @@ def evaluate_test_semgaze_metrics(model: Qwen3VLGazeModel, loader: DataLoader, c
 def train_loop(cfg: Dict):
     os.makedirs(cfg["train"]["output_dir"], exist_ok=True)
     device = torch.device(cfg["train"].get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+    _validate_data_config(cfg)
 
     artifacts = build_train_artifacts(cfg, device)
     train_loader, val_loader, test_loader = build_dataloaders(cfg, artifacts.model.processor)
 
     model = artifacts.model
     optimizer = artifacts.optimizer
-    scheduler = artifacts.scheduler
     if bool(cfg["train"].get("print_model_summary", True)):
         _print_model_summary(model)
     run = _init_wandb(cfg)
@@ -449,7 +529,25 @@ def train_loop(cfg: Dict):
     if (run is not None) and (wb_watch in {"gradients", "parameters", "all"}):
         wandb.watch(model, log=wb_watch, log_freq=int(wb_cfg.get("watch_freq", 500)))
 
-    print(f"[setup] train_dino={cfg['model'].get('train_dino', False)} dino={cfg['model'].get('dino_name')}")
+    data_cfg = cfg["data"]
+    use_precomputed = bool(data_cfg.get("use_precomputed_dino_features", False))
+    include_mark = bool(data_cfg.get("include_mark_image", True))
+    print(
+        "[setup] "
+        f"train_dino={cfg['model'].get('train_dino', False)} "
+        f"dino={cfg['model'].get('dino_name')} "
+        f"local_files_only={bool(cfg['model'].get('local_files_only', False))} "
+        f"cache_dir={cfg['model'].get('cache_dir', None)} "
+        f"mark_image={include_mark} "
+        f"precomputed_dino={use_precomputed}"
+    )
+    if use_precomputed:
+        print(
+            "[setup] dino_h5 "
+            f"train={data_cfg.get('dino_feature_h5_train')} "
+            f"val={data_cfg.get('dino_feature_h5_val')} "
+            f"test={data_cfg.get('dino_feature_h5_test')}"
+        )
 
     loss_cfg = {
         "heatmap": float(cfg["loss"].get("w_heatmap", 1.0)),
@@ -467,6 +565,22 @@ def train_loop(cfg: Dict):
     amp_enabled, amp_dtype, use_scaler = resolve_amp(cfg["train"], device)
     scaler = torch.amp.GradScaler(enabled=use_scaler)
     grad_accum = int(cfg["train"].get("grad_accum", 1))
+    update_steps_per_epoch = math.ceil(len(train_loader) / max(1, grad_accum))
+    total_steps = update_steps_per_epoch * cfg["train"]["epochs"]
+    warmup_steps = int(total_steps * cfg["optim"].get("warmup_ratio", 0.03))
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return float(step) / max(1.0, float(warmup_steps))
+        progress = float(step - warmup_steps) / max(1.0, float(total_steps - warmup_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    print(
+        "[setup] "
+        f"grad_accum={grad_accum} updates/epoch={update_steps_per_epoch} "
+        f"total_updates={total_steps} warmup_updates={warmup_steps}"
+    )
     best_val = float("inf")
     global_step = 0
 
@@ -562,27 +676,39 @@ def train_loop(cfg: Dict):
                         }
                     )
 
-        metrics = evaluate(model, val_loader, cfg, device)
-        tqdm.write(f"[val] epoch={epoch+1} val_l2={metrics['val_l2']:.4f} val_inout_acc={metrics['val_inout_acc']:.4f}")
+        # Flush last partial accumulation so remainder micro-batches are not dropped.
+        if (len(train_loader) % max(1, grad_accum)) != 0:
+            if use_scaler:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
+            global_step += 1
+
+        metrics = evaluate(model, val_loader, cfg, device, loss_cfg)
+        tqdm.write(
+            f"[val] epoch={epoch+1} "
+            f"dist={metrics['metric/val/dist']:.4f} "
+            f"inout_acc={metrics['metric/val/inout_acc']:.4f} "
+            f"loss={metrics['loss/val']:.4f}"
+        )
         if run is not None:
-            wandb.log(
-                {
-                    "metric/val/l2": metrics["val_l2"],
-                    "metric/val/inout_acc": metrics["val_inout_acc"],
-                    "epoch": epoch + 1,
-                }
-            )
+            metrics_to_log = dict(metrics)
+            metrics_to_log["epoch"] = epoch + 1
+            wandb.log(metrics_to_log)
 
         ckpt_last = os.path.join(cfg["train"]["output_dir"], "last.pt")
         torch.save({"model": model.state_dict(), "epoch": epoch + 1, "metrics": metrics}, ckpt_last)
 
-        if metrics["val_l2"] < best_val:
-            best_val = metrics["val_l2"]
+        if metrics["metric/val/dist"] < best_val:
+            best_val = metrics["metric/val/dist"]
             ckpt_best = os.path.join(cfg["train"]["output_dir"], "best.pt")
             torch.save({"model": model.state_dict(), "epoch": epoch + 1, "metrics": metrics}, ckpt_best)
             tqdm.write(
                 f"Epoch {epoch+1}, global step {global_step}: "
-                f"'metric/val/l2' reached {metrics['val_l2']:.5f} (best {best_val:.5f}), "
+                f"'metric/val/dist' reached {metrics['metric/val/dist']:.5f} (best {best_val:.5f}), "
                 f"saving model to '{ckpt_best}' as top 1"
             )
 

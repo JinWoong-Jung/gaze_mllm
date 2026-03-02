@@ -372,10 +372,11 @@ class GazeFollowReasonDataset(Dataset):
 
 
 class QwenVLBatchCollator:
-    def __init__(self, processor, base_prompt: str, include_mark_image: bool = True):
+    def __init__(self, processor, base_prompt: str, include_mark_image: bool = True, qwen_image_size: int = 256):
         self.processor = processor
         self.base_prompt = base_prompt
         self.include_mark_image = include_mark_image
+        self.qwen_image_size = int(qwen_image_size)
 
     def _build_text(self, prompt_text: str, reason_text: str) -> str:
         pieces: List[str] = [self.base_prompt]
@@ -386,21 +387,22 @@ class QwenVLBatchCollator:
         return "\n\n".join(pieces)
 
     @staticmethod
-    def _build_composite_image(scene: Image.Image, mark: Optional[Image.Image]) -> Image.Image:
-        # Single image for Qwen-VL input: [scene | mark]
-        target_h = 448
-        images = [scene, mark if mark is not None else scene]
-        resized = []
-        for img in images:
-            w, h = img.size
-            new_w = max(1, int(w * (target_h / max(1, h))))
-            resized.append(img.resize((new_w, target_h)))
-        total_w = sum(im.size[0] for im in resized)
-        canvas = Image.new("RGB", (total_w, target_h), color=(0, 0, 0))
-        x = 0
-        for im in resized:
-            canvas.paste(im, (x, 0))
-            x += im.size[0]
+    def _resize_exact(img: Image.Image, width: int, height: int) -> Image.Image:
+        return img.resize((int(width), int(height)))
+
+    @staticmethod
+    def _build_composite_image(scene: Image.Image, mark: Optional[Image.Image], size: int = 256) -> Image.Image:
+        # Qwen-VL input image fixed to [size, size].
+        if mark is None:
+            return QwenVLBatchCollator._resize_exact(scene, size, size)
+
+        left_w = size // 2
+        right_w = size - left_w
+        scene_half = QwenVLBatchCollator._resize_exact(scene, left_w, size)
+        mark_half = QwenVLBatchCollator._resize_exact(mark, right_w, size)
+        canvas = Image.new("RGB", (size, size), color=(0, 0, 0))
+        canvas.paste(scene_half, (0, 0))
+        canvas.paste(mark_half, (left_w, 0))
         return canvas
 
     def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
@@ -408,7 +410,10 @@ class QwenVLBatchCollator:
         qwen_images: List[Image.Image] = []
         scene_images: List[Image.Image] = []
         mark_images: List[Image.Image] = []
-        has_precomputed = [("scene_dino_feat" in item) and ("mark_dino_feat" in item) for item in batch]
+        if self.include_mark_image:
+            has_precomputed = [("scene_dino_feat" in item) and ("mark_dino_feat" in item) for item in batch]
+        else:
+            has_precomputed = [("scene_dino_feat" in item) for item in batch]
 
         for item in batch:
             text_body = self._build_text(item["prompt_text"], item["reason_text"])
@@ -416,7 +421,10 @@ class QwenVLBatchCollator:
             mark = item.get("mark_image", None)
             if scene is None:
                 raise ValueError("Missing scene_image for Qwen-VL image input.")
-            mark = mark if mark is not None else scene
+            if self.include_mark_image:
+                mark = mark if mark is not None else scene
+            else:
+                mark = None
 
             # Ensure Qwen gets image tokens via chat template.
             if hasattr(self.processor, "apply_chat_template"):
@@ -437,11 +445,12 @@ class QwenVLBatchCollator:
             else:
                 prompt = text_body
             text_inputs.append(prompt)
-            qwen_images.append(self._build_composite_image(scene, mark))
+            qwen_images.append(self._build_composite_image(scene, mark, size=self.qwen_image_size))
 
             if not all(has_precomputed):
                 scene_images.append(scene)
-                mark_images.append(mark)
+                if self.include_mark_image:
+                    mark_images.append(mark)
 
         if any(has_precomputed) and (not all(has_precomputed)):
             raise ValueError(
@@ -469,9 +478,15 @@ class QwenVLBatchCollator:
         if "gaze_points" in batch[0]:
             model_inputs["gaze_points"] = torch.stack([item["gaze_points"] for item in batch], dim=0)
         if "scene_dino_feat" in batch[0]:
-            model_inputs["scene_dino_feat"] = torch.stack([item["scene_dino_feat"] for item in batch], dim=0)
-            model_inputs["mark_dino_feat"] = torch.stack([item["mark_dino_feat"] for item in batch], dim=0)
+            scene_feat = torch.stack([item["scene_dino_feat"] for item in batch], dim=0)
+            model_inputs["scene_dino_feat"] = scene_feat
+            if self.include_mark_image and ("mark_dino_feat" in batch[0]):
+                model_inputs["mark_dino_feat"] = torch.stack([item["mark_dino_feat"] for item in batch], dim=0)
+            else:
+                # Hard-off mark branch when include_mark_image=False.
+                model_inputs["mark_dino_feat"] = torch.zeros_like(scene_feat)
         else:
             model_inputs["scene_images"] = scene_images
-            model_inputs["mark_images"] = mark_images
+            if self.include_mark_image:
+                model_inputs["mark_images"] = mark_images
         return model_inputs

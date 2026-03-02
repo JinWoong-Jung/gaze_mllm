@@ -17,3 +17,9 @@ checkpoint/*
 # checkpoints/ (plural)
 checkpoints/*
 !checkpoints/.gitkeep
+
+# local
+local_cache/*
+
+# local_models
+local_models/*
