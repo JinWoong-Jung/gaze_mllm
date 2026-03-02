@@ -228,17 +228,14 @@ def compute_losses(
     in_mask = (targets["inout"] > 0.5)
 
     loss_coord = torch.tensor(0.0, device=targets["gaze_xy"].device)
+    # vec loss intentionally disabled to avoid redundant direction supervision with angle head.
     loss_vec = torch.tensor(0.0, device=targets["gaze_xy"].device)
     if in_mask.any():
         pred_xy = preds["gaze_xy"][in_mask]
         gt_xy = targets["gaze_xy"][in_mask]
-        eye_xy = targets["eye_xy"][in_mask]
 
         loss_coord = F.smooth_l1_loss(pred_xy, gt_xy)
-
-        pred_vec_from_xy = F.normalize(pred_xy - eye_xy, p=2, dim=-1)
-        gt_vec = F.normalize(gt_xy - eye_xy, p=2, dim=-1)
-        loss_vec = (1.0 - F.cosine_similarity(pred_vec_from_xy, gt_vec, dim=-1)).mean()
+        gt_vec = F.normalize(gt_xy - targets["eye_xy"][in_mask], p=2, dim=-1)
     else:
         gt_vec = F.normalize(targets["gaze_xy"] - targets["eye_xy"], p=2, dim=-1)
 

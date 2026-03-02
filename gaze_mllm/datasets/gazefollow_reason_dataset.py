@@ -284,13 +284,11 @@ class GazeFollowReasonDataset(Dataset):
         scene_dino_feat, mark_dino_feat = self._load_dino_from_h5(reason_key)
         use_dino_precomputed = (scene_dino_feat is not None) and (mark_dino_feat is not None)
 
-        # Skip image I/O when precomputed DINO features are available.
-        scene_img = None
+        # Qwen-VL path requires actual images; keep loading scene/mark even with precomputed DINO.
+        scene_img = self._safe_open_image(p.scene)
         mark_img = None
-        if not use_dino_precomputed:
-            scene_img = self._safe_open_image(p.scene)
-            if self.include_mark_image and p.mark and os.path.exists(p.mark):
-                mark_img = self._safe_open_image(p.mark)
+        if self.include_mark_image and p.mark and os.path.exists(p.mark):
+            mark_img = self._safe_open_image(p.mark)
 
         prompt_text = self._read_text(p.prompt)
         reason_text = self._read_text(p.reason_txt) if self.include_reason_text else ""
@@ -387,21 +385,63 @@ class QwenVLBatchCollator:
             pieces.append("Reference reasoning:\n" + reason_text)
         return "\n\n".join(pieces)
 
+    @staticmethod
+    def _build_composite_image(scene: Image.Image, mark: Optional[Image.Image]) -> Image.Image:
+        # Single image for Qwen-VL input: [scene | mark]
+        target_h = 448
+        images = [scene, mark if mark is not None else scene]
+        resized = []
+        for img in images:
+            w, h = img.size
+            new_w = max(1, int(w * (target_h / max(1, h))))
+            resized.append(img.resize((new_w, target_h)))
+        total_w = sum(im.size[0] for im in resized)
+        canvas = Image.new("RGB", (total_w, target_h), color=(0, 0, 0))
+        x = 0
+        for im in resized:
+            canvas.paste(im, (x, 0))
+            x += im.size[0]
+        return canvas
+
     def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
         text_inputs: List[str] = []
+        qwen_images: List[Image.Image] = []
         scene_images: List[Image.Image] = []
         mark_images: List[Image.Image] = []
         has_precomputed = [("scene_dino_feat" in item) and ("mark_dino_feat" in item) for item in batch]
 
         for item in batch:
-            text_inputs.append(self._build_text(item["prompt_text"], item["reason_text"]))
+            text_body = self._build_text(item["prompt_text"], item["reason_text"])
+            scene = item.get("scene_image", None)
+            mark = item.get("mark_image", None)
+            if scene is None:
+                raise ValueError("Missing scene_image for Qwen-VL image input.")
+            mark = mark if mark is not None else scene
+
+            # Ensure Qwen gets image tokens via chat template.
+            if hasattr(self.processor, "apply_chat_template"):
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image"},
+                            {"type": "text", "text": text_body},
+                        ],
+                    }
+                ]
+                prompt = self.processor.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                )
+            else:
+                prompt = text_body
+            text_inputs.append(prompt)
+            qwen_images.append(self._build_composite_image(scene, mark))
+
             if not all(has_precomputed):
-                scene = item.get("scene_image", None)
-                mark = item.get("mark_image", None)
-                if scene is None:
-                    raise ValueError("Missing scene_image for online DINO path.")
                 scene_images.append(scene)
-                mark_images.append(mark if mark is not None else scene)
+                mark_images.append(mark)
 
         if any(has_precomputed) and (not all(has_precomputed)):
             raise ValueError(
@@ -411,6 +451,7 @@ class QwenVLBatchCollator:
 
         model_inputs = self.processor(
             text=text_inputs,
+            images=qwen_images,
             return_tensors="pt",
             padding=True,
             truncation=True,

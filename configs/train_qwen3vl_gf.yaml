@@ -43,9 +43,9 @@ prompt:
 
 loss:
   # recommended baseline
-  w_heatmap: 1.0
+  w_heatmap: 10.0
   w_coord: 1.0
-  w_vec: 0.5
+  w_vec: 0.0  # disabled: use angle head for direction supervision
   w_angle: 1.0
   w_inout: 0.5
   w_reason: 0.3
