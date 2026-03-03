@@ -35,6 +35,13 @@ data:
   dino_feature_h5_val: /home/elicer/gaze_mllm/data/dino_features/val.h5
   dino_feature_h5_test: /home/elicer/gaze_mllm/data/dino_features/test.h5
 
+  use_cached_qwen_hidden: true
+  qwen_hidden_h5_train: /home/elicer/gaze_mllm/data/qwen_hidden/train.h5
+  qwen_hidden_h5_val: /home/elicer/gaze_mllm/data/qwen_hidden/val.h5
+  qwen_hidden_h5_test: /home/elicer/gaze_mllm/data/qwen_hidden/test.h5
+  cached_qwen_missing_policy: error
+
+  include_head_image: true
   include_mark_image: true
   include_reason_text: false
 
@@ -43,6 +50,9 @@ prompt:
     You are a gaze estimation model.
     Given scene image, head crop, and visual-prompt image, predict where the person is looking.
     Return internal representation that helps coordinate regression.
+
+heads:
+  enabled: [heatmap, inout, label, coord, reason, angle]
 
 loss:
   w_heatmap: 100.0
@@ -57,7 +67,8 @@ loss:
   reason_dim: 1024
   label_dim: 512
   angle_feature_dim: 512
-  reason_loss_type: cosine
+  reason_loss_type: cosine # or mse
+  reason_nce_temperature: 0.07
 
 optim:
   lr: 2.0e-4
@@ -70,7 +81,7 @@ train:
   precision: bf16
   print_model_summary: true
   sanity_val_steps: 0
-  epochs: 1
+  epochs: 3
   batch_size: 64
   grad_accum: 4
   num_workers: 12

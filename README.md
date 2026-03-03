@@ -22,12 +22,36 @@ Qwen3-VL 기반 gaze estimation 학습 파이프라인입니다.
 
 ## 입력
 - scene image
+- head crop image
 - mark image (visual-prompted image)
 - text prompt
 
 Qwen 입력 이미지는 collator에서 고정 해상도로 구성됩니다.
 - `data.qwen_image_size` (기본 256)
-- mark 사용 시 scene/mark를 좌우 분할한 단일 정사각 이미지로 합성
+- mark/head 사용 시 scene/head/mark를 가로 분할한 단일 정사각 이미지로 합성
+
+## Qwen hidden 캐시 (B1)
+Qwen backbone이 frozen(`train_mode=head_only`)일 때는 pooled hidden을 H5로 미리 캐시해
+학습 중 Qwen forward를 생략할 수 있습니다.
+
+캐시 생성:
+```bash
+python tools/cache_qwen_hidden.py \
+  --config configs/train_qwen3vl_gf.yaml \
+  --split train \
+  --output_h5 /home/elicer/gaze_mllm/data/qwen_hidden/train.h5 \
+  --batch_size 64 --num_workers 12 --overwrite
+```
+
+출력 H5 포맷:
+- `keys`
+- `sample_ids`
+- `embeddings` (pooled hidden)
+
+학습 시 config:
+- `data.use_cached_qwen_hidden: true`
+- `data.qwen_hidden_h5_train/val/test`: split별 H5 경로
+- `data.cached_qwen_missing_policy`: `error | skip`
 
 ## Loss
 Global loss는 가중합입니다.
@@ -82,6 +106,8 @@ train/val/test 각각 추출한 H5를 config에 지정해 사용합니다.
 ## Reason feature 사용
 - 우선순위: `reason_feature_h5_path` -> `reason_feature_root`(`.pt`) fallback
 - H5 포맷: `keys`, `embeddings`
+- `loss.reason_loss_type`: `cosine | mse | infonce`
+- `loss.reason_nce_temperature`: InfoNCE temperature (기본 `0.07`)
 
 ## 실행
 ```bash
@@ -100,6 +126,7 @@ python train.py --config configs/train_qwen3vl_gf.yaml
 
 ## 주요 설정 키
 - `model.train_mode`: `head_only | lora | full`
+- `heads.enabled`: 활성화할 head 리스트 (`heatmap,inout,label,coord,reason,angle`)
 - `model.gradient_checkpointing`
 - `train.precision`: `bf16 | fp16 | fp32`
 - `train.batch_size`, `train.grad_accum`

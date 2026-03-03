@@ -97,6 +97,31 @@ def _init_wandb(cfg: Dict):
     return run
 
 
+def _log_metric_bar_chart(run, metrics: Dict[str, float], chart_key: str, title: str, epoch: Optional[int] = None):
+    if (run is None) or (wandb is None):
+        return
+    rows = []
+    for k, v in metrics.items():
+        if not str(k).startswith("metric/"):
+            continue
+        try:
+            fv = float(v)
+        except Exception:
+            continue
+        if not math.isfinite(fv):
+            continue
+        rows.append([str(k), fv])
+    if len(rows) == 0:
+        return
+    table = wandb.Table(columns=["metric", "value"], data=rows)
+    payload = {
+        chart_key: wandb.plot.bar(table, "metric", "value", title=title),
+    }
+    if epoch is not None:
+        payload["epoch"] = int(epoch)
+    wandb.log(payload)
+
+
 def resolve_amp(train_cfg: Dict, device: torch.device):
     precision = str(train_cfg.get("precision", "bf16")).lower()
     if precision == "bf16":
@@ -113,26 +138,50 @@ def _default(path_base: str, filename: str) -> str:
     return os.path.join(path_base, filename)
 
 
+def _assert_head_only_eval_state(model: Qwen3VLGazeModel, cfg: Dict):
+    train_mode = str(cfg.get("model", {}).get("train_mode", "")).lower()
+    if train_mode != "head_only":
+        return
+    assert not model.backbone.training, "head_only mode requires backbone.eval() during training"
+    if model.dino_encoder is not None:
+        assert not model.dino_encoder.training, "head_only mode requires DINO eval() during training"
+
+
 def _validate_data_config(cfg: Dict):
     data_cfg = cfg["data"]
     use_precomputed = bool(data_cfg.get("use_precomputed_dino_features", False))
-    if not use_precomputed:
-        return
+    if use_precomputed:
+        required = [("train", data_cfg.get("dino_feature_h5_train")), ("val", data_cfg.get("dino_feature_h5_val"))]
+        if data_cfg.get("test_annotation"):
+            required.append(("test", data_cfg.get("dino_feature_h5_test")))
 
-    required = [("train", data_cfg.get("dino_feature_h5_train")), ("val", data_cfg.get("dino_feature_h5_val"))]
-    if data_cfg.get("test_annotation"):
-        required.append(("test", data_cfg.get("dino_feature_h5_test")))
+        missing = []
+        for split, path in required:
+            if (path is None) or (str(path).strip() == "") or (not os.path.exists(path)):
+                missing.append((split, path))
+        if missing:
+            details = ", ".join([f"{split}={path}" for split, path in missing])
+            raise ValueError(
+                "data.use_precomputed_dino_features=true 이지만 유효한 H5 경로가 없습니다. "
+                f"누락/미존재: {details}"
+            )
 
-    missing = []
-    for split, path in required:
-        if (path is None) or (str(path).strip() == "") or (not os.path.exists(path)):
-            missing.append((split, path))
-    if missing:
-        details = ", ".join([f"{split}={path}" for split, path in missing])
-        raise ValueError(
-            "data.use_precomputed_dino_features=true 이지만 유효한 H5 경로가 없습니다. "
-            f"누락/미존재: {details}"
-        )
+    use_cached_qwen = bool(data_cfg.get("use_cached_qwen_hidden", False))
+    if use_cached_qwen:
+        qwen_required = [("train", data_cfg.get("qwen_hidden_h5_train")), ("val", data_cfg.get("qwen_hidden_h5_val"))]
+        if data_cfg.get("test_annotation"):
+            qwen_required.append(("test", data_cfg.get("qwen_hidden_h5_test")))
+
+        qwen_missing = []
+        for split, path in qwen_required:
+            if (path is None) or (str(path).strip() == "") or (not os.path.exists(path)):
+                qwen_missing.append((split, path))
+        if qwen_missing:
+            details = ", ".join([f"{split}={path}" for split, path in qwen_missing])
+            raise ValueError(
+                "data.use_cached_qwen_hidden=true 이지만 유효한 Qwen hidden H5 경로가 없습니다. "
+                f"누락/미존재: {details}"
+            )
 
 
 def build_dataloaders(cfg: Dict, processor):
@@ -162,7 +211,10 @@ def build_dataloaders(cfg: Dict, processor):
         reason_feature_dim=int(cfg["loss"].get("reason_dim", 1024)),
         use_precomputed_dino_features=bool(data_cfg.get("use_precomputed_dino_features", False)),
         dino_feature_h5_path=data_cfg.get("dino_feature_h5_train"),
+        use_cached_qwen_hidden=bool(data_cfg.get("use_cached_qwen_hidden", False)),
+        qwen_hidden_h5_path=data_cfg.get("qwen_hidden_h5_train"),
         include_mark_image=data_cfg.get("include_mark_image", True),
+        include_head_image=data_cfg.get("include_head_image", True),
         include_reason_text=data_cfg.get("include_reason_text", False),
     )
     val_ds = GazeFollowReasonDataset(
@@ -180,7 +232,10 @@ def build_dataloaders(cfg: Dict, processor):
         reason_feature_dim=int(cfg["loss"].get("reason_dim", 1024)),
         use_precomputed_dino_features=bool(data_cfg.get("use_precomputed_dino_features", False)),
         dino_feature_h5_path=data_cfg.get("dino_feature_h5_val"),
+        use_cached_qwen_hidden=bool(data_cfg.get("use_cached_qwen_hidden", False)),
+        qwen_hidden_h5_path=data_cfg.get("qwen_hidden_h5_val"),
         include_mark_image=data_cfg.get("include_mark_image", True),
+        include_head_image=data_cfg.get("include_head_image", True),
         include_reason_text=data_cfg.get("include_reason_text", False),
     )
 
@@ -202,7 +257,10 @@ def build_dataloaders(cfg: Dict, processor):
             reason_feature_dim=int(cfg["loss"].get("reason_dim", 1024)),
             use_precomputed_dino_features=bool(data_cfg.get("use_precomputed_dino_features", False)),
             dino_feature_h5_path=data_cfg.get("dino_feature_h5_test"),
+            use_cached_qwen_hidden=bool(data_cfg.get("use_cached_qwen_hidden", False)),
+            qwen_hidden_h5_path=data_cfg.get("qwen_hidden_h5_test"),
             include_mark_image=data_cfg.get("include_mark_image", True),
+            include_head_image=data_cfg.get("include_head_image", True),
             include_reason_text=data_cfg.get("include_reason_text", False),
         )
 
@@ -210,6 +268,9 @@ def build_dataloaders(cfg: Dict, processor):
         processor=processor,
         base_prompt=prompt_cfg["base"],
         include_mark_image=data_cfg.get("include_mark_image", True),
+        include_head_image=data_cfg.get("include_head_image", True),
+        use_cached_qwen_hidden=bool(data_cfg.get("use_cached_qwen_hidden", False)),
+        cached_qwen_missing_policy=data_cfg.get("cached_qwen_missing_policy", "error"),
         qwen_image_size=int(data_cfg.get("qwen_image_size", 256)),
     )
 
@@ -247,6 +308,7 @@ def build_dataloaders(cfg: Dict, processor):
 def build_train_artifacts(cfg: Dict, device: torch.device) -> TrainArtifacts:
     model_cfg = cfg["model"]
     data_cfg = cfg["data"]
+    heads_cfg = cfg.get("heads", {})
     model = Qwen3VLGazeModel(
         model_name=model_cfg["name"],
         torch_dtype=model_cfg.get("dtype", "bfloat16"),
@@ -264,6 +326,7 @@ def build_train_artifacts(cfg: Dict, device: torch.device) -> TrainArtifacts:
         local_files_only=bool(model_cfg.get("local_files_only", False)),
         use_precomputed_dino_features=bool(data_cfg.get("use_precomputed_dino_features", False)),
         dino_hidden_size_override=int(model_cfg.get("dino_hidden_size", 768)),
+        enabled_heads=heads_cfg.get("enabled", None),
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -274,7 +337,9 @@ def build_train_artifacts(cfg: Dict, device: torch.device) -> TrainArtifacts:
     return TrainArtifacts(model=model, optimizer=optimizer)
 
 
-def to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
+def to_device(batch: Optional[Dict[str, torch.Tensor]], device: torch.device) -> Optional[Dict[str, torch.Tensor]]:
+    if batch is None:
+        return None
     moved = {}
     for k, v in batch.items():
         if isinstance(v, torch.Tensor):
@@ -351,6 +416,8 @@ def evaluate(model: Qwen3VLGazeModel, loader: DataLoader, cfg: Dict, device: tor
     total_in = 0
     total_inout_correct = 0
     total_n = 0
+    has_pred_xy = False
+    has_pred_inout = False
     num_batches = 0
     loss_sums = {
         "total": 0.0,
@@ -373,30 +440,40 @@ def evaluate(model: Qwen3VLGazeModel, loader: DataLoader, cfg: Dict, device: tor
     )
     for batch in iterator:
         batch = to_device(batch, device)
+        if batch is None:
+            continue
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             preds = model(batch)
-            losses = compute_losses(preds, batch, loss_cfg)
+            losses = compute_losses(preds, batch, loss_cfg, enabled_heads=getattr(model, "enabled_heads", None))
         num_batches += 1
         for k in loss_sums.keys():
             loss_sums[k] += float(losses[k].item())
-        pred_heat = torch.sigmoid(preds["gaze_heatmap_logit"])
-        pred_xy = _heatmap_argmax_xy(pred_heat)
+        pred_xy = None
+        if "gaze_heatmap_logit" in preds:
+            pred_heat = torch.sigmoid(preds["gaze_heatmap_logit"])
+            pred_xy = _heatmap_argmax_xy(pred_heat)
+            has_pred_xy = True
+        elif "gaze_xy" in preds:
+            pred_xy = preds["gaze_xy"]
+            has_pred_xy = True
 
         in_mask = (batch["inout"] > 0.5)
-        if in_mask.any():
+        if (pred_xy is not None) and in_mask.any():
             dist = torch.norm(pred_xy[in_mask] - batch["gaze_xy"][in_mask], dim=-1)
             total_dist += dist.sum().item()
             total_in += int(in_mask.sum().item())
 
-        inout_pred = (torch.sigmoid(preds["inout_logit"]) > 0.5).float()
-        total_inout_correct += int((inout_pred == batch["inout"]).sum().item())
-        total_n += int(batch["inout"].numel())
+        if "inout_logit" in preds:
+            has_pred_inout = True
+            inout_pred = (torch.sigmoid(preds["inout_logit"]) > 0.5).float()
+            total_inout_correct += int((inout_pred == batch["inout"]).sum().item())
+            total_n += int(batch["inout"].numel())
 
-        if use_pbar:
+        if use_pbar and has_pred_xy:
             iterator.set_postfix(dist=f"{(total_dist / max(1, total_in)):.4f}")
 
-    val_dist = total_dist / max(1, total_in)
-    val_inout = total_inout_correct / max(1, total_n)
+    val_dist = (total_dist / max(1, total_in)) if (has_pred_xy and total_in > 0) else float("nan")
+    val_inout = (total_inout_correct / max(1, total_n)) if (has_pred_inout and total_n > 0) else float("nan")
     mean_losses = {k: (v / max(1, num_batches)) for k, v in loss_sums.items()}
     return {
         # semgaze-style keys
@@ -428,7 +505,8 @@ def evaluate_test_semgaze_metrics(model: Qwen3VLGazeModel, loader: DataLoader, c
     sum_avg_dist = 0.0
     sum_min_dist = 0.0
     sum_auc = 0.0
-    n_obs = 0
+    n_dist_obs = 0
+    n_auc_obs = 0
 
     acc1_correct = 0
     acc3_correct = 0
@@ -447,13 +525,20 @@ def evaluate_test_semgaze_metrics(model: Qwen3VLGazeModel, loader: DataLoader, c
     )
     for batch in iterator:
         batch = to_device(batch, device)
+        if batch is None:
+            continue
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             preds = model(batch)
 
-        pred_heat = torch.sigmoid(preds["gaze_heatmap_logit"])
-        pred_xy = _heatmap_argmax_xy(pred_heat)
+        pred_heat = None
+        pred_xy = None
+        if "gaze_heatmap_logit" in preds:
+            pred_heat = torch.sigmoid(preds["gaze_heatmap_logit"])
+            pred_xy = _heatmap_argmax_xy(pred_heat)
+        elif "gaze_xy" in preds:
+            pred_xy = preds["gaze_xy"]
 
-        if vocab_emb is not None:
+        if (vocab_emb is not None) and ("label_emb" in preds):
             logits = preds["label_emb"] @ vocab_emb.T
             target = batch["gaze_label_id"]
             valid = target >= 0
@@ -474,6 +559,8 @@ def evaluate_test_semgaze_metrics(model: Qwen3VLGazeModel, loader: DataLoader, c
                 multi_acc1_correct += int((valid_ids == pred1).any().item())
                 multi_total += 1
 
+        if pred_xy is None:
+            continue
         gaze_points = batch["gaze_points"]
         for i in range(pred_xy.size(0)):
             gp_gt = gaze_points[i]
@@ -487,26 +574,28 @@ def evaluate_test_semgaze_metrics(model: Qwen3VLGazeModel, loader: DataLoader, c
             dists = torch.norm(gp_gt - gp_pred.unsqueeze(0), p=2, dim=1)
             sum_avg_dist += dists.mean().item()
             sum_min_dist += dists.min().item()
+            n_dist_obs += 1
 
-            hm_gt = _binary_gt_heatmap(gp_gt, size=64)
-            auc = binary_auroc(pred_heat[i].flatten(), hm_gt.flatten().long())
-            sum_auc += float(auc.item())
-            n_obs += 1
+            if pred_heat is not None:
+                hm_gt = _binary_gt_heatmap(gp_gt, size=64)
+                auc = binary_auroc(pred_heat[i].flatten(), hm_gt.flatten().long())
+                sum_auc += float(auc.item())
+                n_auc_obs += 1
 
         if use_pbar:
             iterator.set_postfix(
-                auc=f"{(sum_auc / max(1, n_obs)):.4f}",
-                avg_dist=f"{(sum_avg_dist / max(1, n_obs)):.4f}",
+                auc=f"{(sum_auc / max(1, n_auc_obs)):.4f}" if n_auc_obs > 0 else "nan",
+                avg_dist=f"{(sum_avg_dist / max(1, n_dist_obs)):.4f}" if n_dist_obs > 0 else "nan",
             )
 
     metrics = {
-        "metric/test/acc@1": (acc1_correct / max(1, acc_total)),
-        "metric/test/acc@3": (acc3_correct / max(1, acc_total)),
-        "metric/test/auc": (sum_auc / max(1, n_obs)),
-        "metric/test/dist_to_avg": (sum_dist_to_avg / max(1, n_obs)),
-        "metric/test/avg_dist": (sum_avg_dist / max(1, n_obs)),
-        "metric/test/min_dist": (sum_min_dist / max(1, n_obs)),
-        "metric/test/multi_acc@1": (multi_acc1_correct / max(1, multi_total)),
+        "metric/test/acc@1": (acc1_correct / max(1, acc_total)) if acc_total > 0 else float("nan"),
+        "metric/test/acc@3": (acc3_correct / max(1, acc_total)) if acc_total > 0 else float("nan"),
+        "metric/test/auc": (sum_auc / max(1, n_auc_obs)) if n_auc_obs > 0 else float("nan"),
+        "metric/test/dist_to_avg": (sum_dist_to_avg / max(1, n_dist_obs)) if n_dist_obs > 0 else float("nan"),
+        "metric/test/avg_dist": (sum_avg_dist / max(1, n_dist_obs)) if n_dist_obs > 0 else float("nan"),
+        "metric/test/min_dist": (sum_min_dist / max(1, n_dist_obs)) if n_dist_obs > 0 else float("nan"),
+        "metric/test/multi_acc@1": (multi_acc1_correct / max(1, multi_total)) if multi_total > 0 else float("nan"),
     }
     return metrics
 
@@ -531,15 +620,21 @@ def train_loop(cfg: Dict):
 
     data_cfg = cfg["data"]
     use_precomputed = bool(data_cfg.get("use_precomputed_dino_features", False))
+    use_cached_qwen = bool(data_cfg.get("use_cached_qwen_hidden", False))
     include_mark = bool(data_cfg.get("include_mark_image", True))
+    include_head = bool(data_cfg.get("include_head_image", True))
+    enabled_heads = sorted(list(getattr(model, "enabled_heads", set())))
     print(
         "[setup] "
         f"train_dino={cfg['model'].get('train_dino', False)} "
         f"dino={cfg['model'].get('dino_name')} "
         f"local_files_only={bool(cfg['model'].get('local_files_only', False))} "
         f"cache_dir={cfg['model'].get('cache_dir', None)} "
+        f"head_image={include_head} "
         f"mark_image={include_mark} "
-        f"precomputed_dino={use_precomputed}"
+        f"precomputed_dino={use_precomputed} "
+        f"cached_qwen_hidden={use_cached_qwen} "
+        f"enabled_heads={enabled_heads}"
     )
     if use_precomputed:
         print(
@@ -547,6 +642,14 @@ def train_loop(cfg: Dict):
             f"train={data_cfg.get('dino_feature_h5_train')} "
             f"val={data_cfg.get('dino_feature_h5_val')} "
             f"test={data_cfg.get('dino_feature_h5_test')}"
+        )
+    if use_cached_qwen:
+        print(
+            "[setup] qwen_hidden_h5 "
+            f"train={data_cfg.get('qwen_hidden_h5_train')} "
+            f"val={data_cfg.get('qwen_hidden_h5_val')} "
+            f"test={data_cfg.get('qwen_hidden_h5_test')} "
+            f"missing_policy={data_cfg.get('cached_qwen_missing_policy', 'error')}"
         )
 
     loss_cfg = {
@@ -558,6 +661,7 @@ def train_loop(cfg: Dict):
         "reason": float(cfg["loss"].get("w_reason", 0.3)),
         "label": float(cfg["loss"].get("w_label", 0.3)),
         "reason_loss_type": cfg["loss"].get("reason_loss_type", "cosine"),
+        "reason_nce_temperature": float(cfg["loss"].get("reason_nce_temperature", 0.07)),
         "heatmap_size": int(cfg["loss"].get("heatmap_size", 64)),
         "heatmap_sigma": float(cfg["loss"].get("heatmap_sigma", 3.0)),
     }
@@ -599,14 +703,19 @@ def train_loop(cfg: Dict):
                 if i >= sanity_steps:
                     break
                 batch = to_device(batch, device)
+                if batch is None:
+                    continue
                 with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
                     _ = model(batch)
         model.train()
+        _assert_head_only_eval_state(model, cfg)
 
     for epoch in range(cfg["train"]["epochs"]):
         model.train()
+        _assert_head_only_eval_state(model, cfg)
         optimizer.zero_grad(set_to_none=True)
         running = 0.0
+        seen_batches = 0
         use_pbar = bool(cfg["train"].get("progress_bar", True))
         iterator = tqdm(
             train_loader,
@@ -619,17 +728,21 @@ def train_loop(cfg: Dict):
 
         for i, batch in enumerate(iterator):
             batch = to_device(batch, device)
+            if batch is None:
+                continue
+            _assert_head_only_eval_state(model, cfg)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
                 preds = model(batch)
-                losses = compute_losses(preds, batch, loss_cfg)
+                losses = compute_losses(preds, batch, loss_cfg, enabled_heads=getattr(model, "enabled_heads", None))
                 loss = losses["total"] / grad_accum
+            seen_batches += 1
 
             if use_scaler:
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
 
-            if (i + 1) % grad_accum == 0:
+            if (seen_batches % grad_accum) == 0:
                 if use_scaler:
                     scaler.step(optimizer)
                     scaler.update()
@@ -641,7 +754,7 @@ def train_loop(cfg: Dict):
 
             running += float(losses["total"].item())
             if use_pbar:
-                avg = running / (i + 1)
+                avg = running / max(1, seen_batches)
                 iterator.set_postfix(
                     loss=f"{avg:.4f}",
                     heatmap=f"{float(losses['heatmap'].item()):.4f}",
@@ -650,12 +763,12 @@ def train_loop(cfg: Dict):
                     lr=f"{float(scheduler.get_last_lr()[0]):.2e}",
                 )
 
-            if (i + 1) % cfg["train"].get("log_every", 20) == 0:
-                avg = running / (i + 1)
+            if seen_batches > 0 and (seen_batches % cfg["train"].get("log_every", 20) == 0):
+                avg = running / max(1, seen_batches)
                 # Avoid breaking tqdm rendering: when progress bar is active, keep metrics in postfix only.
                 if not use_pbar:
                     print(
-                        f"epoch={epoch+1} step={i+1}/{len(train_loader)} "
+                        f"epoch={epoch+1} step={seen_batches}/{len(train_loader)} "
                         f"loss={avg:.4f} heatmap={losses['heatmap']:.4f} coord={losses['coord']:.4f} vec={losses['vec']:.4f} "
                         f"angle={losses['angle']:.4f} inout={losses['inout']:.4f} "
                         f"reason={losses['reason']:.4f} label={losses['label']:.4f}"
@@ -677,7 +790,7 @@ def train_loop(cfg: Dict):
                     )
 
         # Flush last partial accumulation so remainder micro-batches are not dropped.
-        if (len(train_loader) % max(1, grad_accum)) != 0:
+        if (seen_batches % max(1, grad_accum)) != 0:
             if use_scaler:
                 scaler.step(optimizer)
                 scaler.update()
@@ -698,6 +811,13 @@ def train_loop(cfg: Dict):
             metrics_to_log = dict(metrics)
             metrics_to_log["epoch"] = epoch + 1
             wandb.log(metrics_to_log)
+            _log_metric_bar_chart(
+                run=run,
+                metrics=metrics,
+                chart_key="charts/val_metrics_bar",
+                title=f"Validation Metrics (epoch {epoch+1})",
+                epoch=epoch + 1,
+            )
 
         ckpt_last = os.path.join(cfg["train"]["output_dir"], "last.pt")
         torch.save({"model": model.state_dict(), "epoch": epoch + 1, "metrics": metrics}, ckpt_last)
@@ -720,6 +840,12 @@ def train_loop(cfg: Dict):
             tqdm.write(f"  {k:<24} {v:.10f}")
         if run is not None:
             wandb.log(test_metrics)
+            _log_metric_bar_chart(
+                run=run,
+                metrics=test_metrics,
+                chart_key="charts/test_metrics_bar",
+                title="Test Metrics",
+            )
 
     if run is not None:
         wandb.finish()

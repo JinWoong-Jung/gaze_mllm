@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -52,7 +53,10 @@ class GazeFollowReasonDataset(Dataset):
         reason_feature_dim: int = 1024,
         use_precomputed_dino_features: bool = False,
         dino_feature_h5_path: Optional[str] = None,
+        use_cached_qwen_hidden: bool = False,
+        qwen_hidden_h5_path: Optional[str] = None,
         include_mark_image: bool = True,
+        include_head_image: bool = True,
         include_reason_text: bool = False,
         max_test_gaze_points: int = 20,
         max_test_label_ids: int = 5,
@@ -67,7 +71,10 @@ class GazeFollowReasonDataset(Dataset):
         self.reason_feature_dim = int(reason_feature_dim)
         self.use_precomputed_dino_features = use_precomputed_dino_features
         self.dino_feature_h5_path = dino_feature_h5_path
+        self.use_cached_qwen_hidden = bool(use_cached_qwen_hidden)
+        self.qwen_hidden_h5_path = qwen_hidden_h5_path
         self.include_mark_image = include_mark_image
+        self.include_head_image = include_head_image
         self.include_reason_text = include_reason_text
         self.max_test_gaze_points = max_test_gaze_points
         self.max_test_label_ids = max_test_label_ids
@@ -75,6 +82,8 @@ class GazeFollowReasonDataset(Dataset):
         self.reason_feature_index = None
         self.dino_feature_h5 = None
         self.dino_feature_index = None
+        self.qwen_hidden_h5 = None
+        self.qwen_hidden_index = None
 
         self.label_embed_root = label_embed_root
         self.label_emb_cache: Dict[str, torch.Tensor] = {}
@@ -170,6 +179,11 @@ class GazeFollowReasonDataset(Dataset):
                 self.dino_feature_h5.close()
             except Exception:
                 pass
+        if self.qwen_hidden_h5 is not None:
+            try:
+                self.qwen_hidden_h5.close()
+            except Exception:
+                pass
 
     def _ensure_dino_h5(self) -> bool:
         if self.dino_feature_h5 is not None:
@@ -214,6 +228,54 @@ class GazeFollowReasonDataset(Dataset):
             return scene, mark
         except Exception:
             return None, None
+
+    def _ensure_qwen_hidden_h5(self) -> bool:
+        if self.qwen_hidden_h5 is not None:
+            return True
+        if (not self.use_cached_qwen_hidden) or (self.qwen_hidden_h5_path is None) or (not os.path.exists(self.qwen_hidden_h5_path)):
+            return False
+        try:
+            self.qwen_hidden_h5 = h5py.File(self.qwen_hidden_h5_path, "r")
+            return True
+        except Exception:
+            self.qwen_hidden_h5 = None
+            return False
+
+    def _build_qwen_hidden_h5_index(self) -> Dict[str, int]:
+        if not self._ensure_qwen_hidden_h5():
+            return {}
+        keys_ds = self.qwen_hidden_h5.get("keys")
+        index = {}
+        if keys_ds is not None:
+            for i, key in enumerate(keys_ds):
+                if isinstance(key, bytes):
+                    key = key.decode("utf-8")
+                index[str(key)] = i
+
+        sample_ids_ds = self.qwen_hidden_h5.get("sample_ids")
+        if sample_ids_ds is not None:
+            for i, sid in enumerate(sample_ids_ds):
+                index[f"id:{int(sid)}"] = i
+        return index
+
+    def _load_qwen_hidden_from_h5(self, key: str, sample_id: Optional[int] = None) -> Optional[torch.Tensor]:
+        if not self._ensure_qwen_hidden_h5():
+            return None
+        if self.qwen_hidden_index is None:
+            self.qwen_hidden_index = self._build_qwen_hidden_h5_index()
+        row_idx = self.qwen_hidden_index.get(key)
+        if (row_idx is None) and (sample_id is not None):
+            row_idx = self.qwen_hidden_index.get(f"id:{int(sample_id)}")
+        if row_idx is None:
+            return None
+        emb_ds = self.qwen_hidden_h5.get("embeddings")
+        if emb_ds is None:
+            return None
+        try:
+            emb = torch.from_numpy(emb_ds[row_idx]).to(torch.float32).flatten()
+            return emb
+        except Exception:
+            return None
 
     def __len__(self) -> int:
         if self.split == "test":
@@ -262,6 +324,47 @@ class GazeFollowReasonDataset(Dataset):
     def _safe_open_image(path: str) -> Image.Image:
         return Image.open(path).convert("RGB")
 
+    @staticmethod
+    def _maybe_to_pixel(v: float, size: int) -> float:
+        # Support both normalized [0,1] and absolute pixel bbox annotations.
+        if 0.0 <= v <= 1.0:
+            return v * float(max(1, size - 1))
+        return v
+
+    def _extract_head_crop(self, scene_img: Image.Image, row: pd.Series) -> Image.Image:
+        if not self.include_head_image:
+            return scene_img
+
+        width, height = scene_img.size
+        try:
+            xmin = float(row["head_xmin"])
+            ymin = float(row["head_ymin"])
+            xmax = float(row["head_xmax"])
+            ymax = float(row["head_ymax"])
+        except Exception:
+            return scene_img
+
+        if not all(math.isfinite(v) for v in [xmin, ymin, xmax, ymax]):
+            return scene_img
+
+        xmin = self._maybe_to_pixel(xmin, width)
+        xmax = self._maybe_to_pixel(xmax, width)
+        ymin = self._maybe_to_pixel(ymin, height)
+        ymax = self._maybe_to_pixel(ymax, height)
+
+        left_f, right_f = sorted([xmin, xmax])
+        top_f, bottom_f = sorted([ymin, ymax])
+
+        left = int(max(0, min(width - 1, math.floor(left_f))))
+        top = int(max(0, min(height - 1, math.floor(top_f))))
+        right = int(max(left + 1, min(width, math.ceil(right_f))))
+        bottom = int(max(top + 1, min(height, math.ceil(bottom_f))))
+
+        if (right <= left) or (bottom <= top):
+            return scene_img
+
+        return scene_img.crop((left, top, right, bottom))
+
     def _get_label_embedding(self, label_name: str) -> torch.Tensor:
         if (not label_name) or (self.label_embed_root is None):
             return torch.zeros(512, dtype=torch.float32)
@@ -284,14 +387,33 @@ class GazeFollowReasonDataset(Dataset):
         scene_dino_feat, mark_dino_feat = self._load_dino_from_h5(reason_key)
         use_dino_precomputed = (scene_dino_feat is not None) and (mark_dino_feat is not None)
 
-        # Qwen-VL path requires actual images; keep loading scene/mark even with precomputed DINO.
-        scene_img = self._safe_open_image(p.scene)
-        mark_img = None
-        if self.include_mark_image and p.mark and os.path.exists(p.mark):
-            mark_img = self._safe_open_image(p.mark)
+        cached_qwen_hidden = None
+        qwen_hidden_valid = torch.tensor(0.0, dtype=torch.float32)
+        if self.use_cached_qwen_hidden:
+            cached_qwen_hidden = self._load_qwen_hidden_from_h5(reason_key, sample_id=sample_id)
+            if cached_qwen_hidden is not None:
+                qwen_hidden_valid = torch.tensor(1.0, dtype=torch.float32)
 
-        prompt_text = self._read_text(p.prompt)
-        reason_text = self._read_text(p.reason_txt) if self.include_reason_text else ""
+        need_qwen_images = not self.use_cached_qwen_hidden
+        need_dino_images = not use_dino_precomputed
+        need_scene_image = need_qwen_images or need_dino_images
+
+        scene_img = None
+        head_img = None
+        mark_img = None
+        if need_scene_image:
+            scene_img = self._safe_open_image(p.scene)
+            if need_qwen_images:
+                head_img = self._extract_head_crop(scene_img, row)
+            if self.include_mark_image and p.mark and os.path.exists(p.mark):
+                mark_img = self._safe_open_image(p.mark)
+
+        if need_qwen_images:
+            prompt_text = self._read_text(p.prompt)
+            reason_text = self._read_text(p.reason_txt) if self.include_reason_text else ""
+        else:
+            prompt_text = ""
+            reason_text = ""
 
         reason_feat = torch.zeros(self.reason_feature_dim, dtype=torch.float32)
         reason_valid = torch.tensor(0.0, dtype=torch.float32)
@@ -332,6 +454,7 @@ class GazeFollowReasonDataset(Dataset):
 
         out = {
             "scene_image": scene_img,
+            "head_image": head_img,
             "mark_image": mark_img,
             "prompt_text": prompt_text,
             "reason_text": reason_text,
@@ -344,6 +467,9 @@ class GazeFollowReasonDataset(Dataset):
             "gaze_label_emb": gaze_label_emb,
             "gaze_label_id": torch.tensor(gaze_label_id, dtype=torch.long),
             "gaze_label_ids": gaze_label_ids,
+            "cache_key": reason_key,
+            "qwen_pooled_hidden": cached_qwen_hidden,
+            "qwen_hidden_valid": qwen_hidden_valid,
             "sample_id": sample_id,
             "path": rel_path,
         }
@@ -372,10 +498,24 @@ class GazeFollowReasonDataset(Dataset):
 
 
 class QwenVLBatchCollator:
-    def __init__(self, processor, base_prompt: str, include_mark_image: bool = True, qwen_image_size: int = 256):
+    def __init__(
+        self,
+        processor,
+        base_prompt: str,
+        include_mark_image: bool = True,
+        include_head_image: bool = True,
+        use_cached_qwen_hidden: bool = False,
+        cached_qwen_missing_policy: str = "error",
+        qwen_image_size: int = 256,
+    ):
         self.processor = processor
         self.base_prompt = base_prompt
         self.include_mark_image = include_mark_image
+        self.include_head_image = include_head_image
+        self.use_cached_qwen_hidden = bool(use_cached_qwen_hidden)
+        self.cached_qwen_missing_policy = str(cached_qwen_missing_policy).lower().strip()
+        if self.cached_qwen_missing_policy not in {"error", "skip"}:
+            raise ValueError(f"Unsupported cached_qwen_missing_policy: {cached_qwen_missing_policy}")
         self.qwen_image_size = int(qwen_image_size)
 
     def _build_text(self, prompt_text: str, reason_text: str) -> str:
@@ -391,65 +531,109 @@ class QwenVLBatchCollator:
         return img.resize((int(width), int(height)))
 
     @staticmethod
-    def _build_composite_image(scene: Image.Image, mark: Optional[Image.Image], size: int = 256) -> Image.Image:
+    def _build_composite_image(
+        scene: Image.Image,
+        head: Optional[Image.Image],
+        mark: Optional[Image.Image],
+        size: int = 256,
+    ) -> Image.Image:
         # Qwen-VL input image fixed to [size, size].
-        if mark is None:
+        if head is None and mark is None:
             return QwenVLBatchCollator._resize_exact(scene, size, size)
 
-        left_w = size // 2
-        right_w = size - left_w
-        scene_half = QwenVLBatchCollator._resize_exact(scene, left_w, size)
-        mark_half = QwenVLBatchCollator._resize_exact(mark, right_w, size)
+        if head is None:
+            head = scene
+
+        if mark is None:
+            left_w = size // 2
+            right_w = size - left_w
+            scene_half = QwenVLBatchCollator._resize_exact(scene, left_w, size)
+            head_half = QwenVLBatchCollator._resize_exact(head, right_w, size)
+            canvas = Image.new("RGB", (size, size), color=(0, 0, 0))
+            canvas.paste(scene_half, (0, 0))
+            canvas.paste(head_half, (left_w, 0))
+            return canvas
+
+        left_w = size // 3
+        mid_w = size // 3
+        right_w = size - left_w - mid_w
+        scene_part = QwenVLBatchCollator._resize_exact(scene, left_w, size)
+        head_part = QwenVLBatchCollator._resize_exact(head, mid_w, size)
+        mark_part = QwenVLBatchCollator._resize_exact(mark, right_w, size)
         canvas = Image.new("RGB", (size, size), color=(0, 0, 0))
-        canvas.paste(scene_half, (0, 0))
-        canvas.paste(mark_half, (left_w, 0))
+        canvas.paste(scene_part, (0, 0))
+        canvas.paste(head_part, (left_w, 0))
+        canvas.paste(mark_part, (left_w + mid_w, 0))
         return canvas
 
-    def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
+    def __call__(self, batch: List[Dict]) -> Optional[Dict[str, torch.Tensor]]:
+        active_batch = batch
+        if self.use_cached_qwen_hidden:
+            missing = [item for item in batch if float(item.get("qwen_hidden_valid", torch.tensor(0.0)).item()) < 0.5]
+            if missing:
+                if self.cached_qwen_missing_policy == "error":
+                    preview = ", ".join([str(m.get("cache_key", "")) for m in missing[:3]])
+                    raise ValueError(
+                        f"Missing cached Qwen hidden for {len(missing)}/{len(batch)} samples. "
+                        f"policy=error preview_keys=[{preview}]"
+                    )
+                active_batch = [item for item in batch if float(item.get("qwen_hidden_valid", torch.tensor(0.0)).item()) > 0.5]
+                if len(active_batch) == 0:
+                    return None
+
         text_inputs: List[str] = []
         qwen_images: List[Image.Image] = []
         scene_images: List[Image.Image] = []
         mark_images: List[Image.Image] = []
         if self.include_mark_image:
-            has_precomputed = [("scene_dino_feat" in item) and ("mark_dino_feat" in item) for item in batch]
+            has_precomputed = [("scene_dino_feat" in item) and ("mark_dino_feat" in item) for item in active_batch]
         else:
-            has_precomputed = [("scene_dino_feat" in item) for item in batch]
+            has_precomputed = [("scene_dino_feat" in item) for item in active_batch]
 
-        for item in batch:
-            text_body = self._build_text(item["prompt_text"], item["reason_text"])
+        for item in active_batch:
             scene = item.get("scene_image", None)
+            head = item.get("head_image", None)
             mark = item.get("mark_image", None)
-            if scene is None:
-                raise ValueError("Missing scene_image for Qwen-VL image input.")
-            if self.include_mark_image:
-                mark = mark if mark is not None else scene
-            else:
-                mark = None
+            if not self.use_cached_qwen_hidden:
+                text_body = self._build_text(item["prompt_text"], item["reason_text"])
+                if scene is None:
+                    raise ValueError("Missing scene_image for Qwen-VL image input.")
+                if self.include_head_image:
+                    head = head if head is not None else scene
+                else:
+                    head = None
+                if self.include_mark_image:
+                    mark = mark if mark is not None else scene
+                else:
+                    mark = None
 
-            # Ensure Qwen gets image tokens via chat template.
-            if hasattr(self.processor, "apply_chat_template"):
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image"},
-                            {"type": "text", "text": text_body},
-                        ],
-                    }
-                ]
-                prompt = self.processor.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=False,
-                )
-            else:
-                prompt = text_body
-            text_inputs.append(prompt)
-            qwen_images.append(self._build_composite_image(scene, mark, size=self.qwen_image_size))
+                # Ensure Qwen gets image tokens via chat template.
+                if hasattr(self.processor, "apply_chat_template"):
+                    messages = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image"},
+                                {"type": "text", "text": text_body},
+                            ],
+                        }
+                    ]
+                    prompt = self.processor.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=False,
+                    )
+                else:
+                    prompt = text_body
+                text_inputs.append(prompt)
+                qwen_images.append(self._build_composite_image(scene, head, mark, size=self.qwen_image_size))
 
             if not all(has_precomputed):
+                if scene is None:
+                    raise ValueError("Missing scene_image for DINO online encoding.")
                 scene_images.append(scene)
                 if self.include_mark_image:
+                    mark = mark if mark is not None else scene
                     mark_images.append(mark)
 
         if any(has_precomputed) and (not all(has_precomputed)):
@@ -458,30 +642,43 @@ class QwenVLBatchCollator:
                 "Ensure dino_feature_h5 covers all samples or disable use_precomputed_dino_features."
             )
 
-        model_inputs = self.processor(
-            text=text_inputs,
-            images=qwen_images,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-        )
+        if self.use_cached_qwen_hidden:
+            model_inputs = {
+                "qwen_pooled_hidden": torch.stack([item["qwen_pooled_hidden"] for item in active_batch], dim=0),
+            }
+        else:
+            model_inputs = self.processor(
+                text=text_inputs,
+                images=qwen_images,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+            )
 
-        model_inputs["gaze_xy"] = torch.stack([item["gaze_xy"] for item in batch], dim=0)
-        model_inputs["gaze_vec"] = torch.stack([item["gaze_vec"] for item in batch], dim=0)
-        model_inputs["eye_xy"] = torch.stack([item["eye_xy"] for item in batch], dim=0)
-        model_inputs["inout"] = torch.stack([item["inout"] for item in batch], dim=0)
-        model_inputs["reason_feat"] = torch.stack([item["reason_feat"] for item in batch], dim=0)
-        model_inputs["reason_valid"] = torch.stack([item["reason_valid"] for item in batch], dim=0)
-        model_inputs["gaze_label_emb"] = torch.stack([item["gaze_label_emb"] for item in batch], dim=0)
-        model_inputs["gaze_label_id"] = torch.stack([item["gaze_label_id"] for item in batch], dim=0)
-        model_inputs["gaze_label_ids"] = torch.stack([item["gaze_label_ids"] for item in batch], dim=0)
-        if "gaze_points" in batch[0]:
-            model_inputs["gaze_points"] = torch.stack([item["gaze_points"] for item in batch], dim=0)
-        if "scene_dino_feat" in batch[0]:
-            scene_feat = torch.stack([item["scene_dino_feat"] for item in batch], dim=0)
+        model_inputs["gaze_xy"] = torch.stack([item["gaze_xy"] for item in active_batch], dim=0)
+        model_inputs["gaze_vec"] = torch.stack([item["gaze_vec"] for item in active_batch], dim=0)
+        model_inputs["eye_xy"] = torch.stack([item["eye_xy"] for item in active_batch], dim=0)
+        model_inputs["inout"] = torch.stack([item["inout"] for item in active_batch], dim=0)
+        model_inputs["reason_feat"] = torch.stack([item["reason_feat"] for item in active_batch], dim=0)
+        model_inputs["reason_valid"] = torch.stack([item["reason_valid"] for item in active_batch], dim=0)
+        model_inputs["gaze_label_emb"] = torch.stack([item["gaze_label_emb"] for item in active_batch], dim=0)
+        model_inputs["gaze_label_id"] = torch.stack([item["gaze_label_id"] for item in active_batch], dim=0)
+        model_inputs["gaze_label_ids"] = torch.stack([item["gaze_label_ids"] for item in active_batch], dim=0)
+        model_inputs["head_in_qwen"] = torch.full(
+            (len(active_batch),),
+            1.0 if (self.include_head_image and (not self.use_cached_qwen_hidden)) else 0.0,
+            dtype=torch.float32,
+        )
+        model_inputs["sample_id"] = torch.tensor([int(item["sample_id"]) for item in active_batch], dtype=torch.long)
+        model_inputs["cache_key"] = [str(item["cache_key"]) for item in active_batch]
+        model_inputs["path"] = [str(item["path"]) for item in active_batch]
+        if "gaze_points" in active_batch[0]:
+            model_inputs["gaze_points"] = torch.stack([item["gaze_points"] for item in active_batch], dim=0)
+        if "scene_dino_feat" in active_batch[0]:
+            scene_feat = torch.stack([item["scene_dino_feat"] for item in active_batch], dim=0)
             model_inputs["scene_dino_feat"] = scene_feat
-            if self.include_mark_image and ("mark_dino_feat" in batch[0]):
-                model_inputs["mark_dino_feat"] = torch.stack([item["mark_dino_feat"] for item in batch], dim=0)
+            if self.include_mark_image and ("mark_dino_feat" in active_batch[0]):
+                model_inputs["mark_dino_feat"] = torch.stack([item["mark_dino_feat"] for item in active_batch], dim=0)
             else:
                 # Hard-off mark branch when include_mark_image=False.
                 model_inputs["mark_dino_feat"] = torch.zeros_like(scene_feat)
